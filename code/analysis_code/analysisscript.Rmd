@@ -1,0 +1,463 @@
+---
+title: "MADA Exercise flu data analysis"
+author: "Andreas Handel"
+date: "10/28/2021"
+output: html_document
+---
+
+  
+
+This script loads the cleaned data, 
+does a bit more processing, and then performs some ML analyses.
+
+
+# Setup
+
+```{r}
+#load needed packages. make sure they are installed.
+library(broom) #for cleaning up output from lm()
+library(here) #for data loading/saving
+library(recipes)
+library(parsnip)
+library(dials)
+library(tune)
+library(yardstick)
+library(rsample)
+library(workflows)
+library(rpart)
+library(rpart.plot)
+library(glmnet)
+library(ranger)
+library(doParallel) # for parallel computing 
+```
+
+
+Load the data.
+
+```{r}
+#Path to data. Note the use of the here() package and not absolute paths
+data_location <- here::here("data","processed_data","processeddata.rds")
+#load data
+mydata <- readRDS(data_location)
+```
+
+
+Set a seed for reproducibility.
+
+```{r}
+# for reproducibility
+set.seed(123)
+```
+
+
+Split data into train and test, set up cross-validation.
+
+```{r}
+# split train and test, using the outcome as stratifier
+data_split <- rsample::initial_split(mydata,strata = 'BodyTemp')
+
+# Create data frames for the two sets:
+train_data <- rsample::training(data_split)
+test_data  <- rsample::testing(data_split)
+
+# create CV object from training data
+cv_data <- rsample::vfold_cv(train_data, v = 5, repeats = 5, strata = 'BodyTemp')
+```
+
+
+
+# Preprocessing
+
+create a recipe for the model fitting. we don't need to remove any NA or do imputation or standardization or anything else.
+Therefore our recipe is fairly short, we just code all categorical variables as dummy variables.
+
+```{r}
+fit_recipe <- 
+  recipe(BodyTemp ~ ., data = train_data) %>%
+  step_dummy(all_nominal()) 
+```
+
+
+# Null model
+
+For a continuous outcome, a null-model that doesn't use any predictor information is one that always just predicts the mean of the data. We'll compute the performance of such a "model" here. It's useful for comparison with the real models. We'll print both numbers here, and then compare with our model results below.
+
+```{r}
+RMSE_null_train <- sqrt(sum( (train_data$BodyTemp - mean(train_data$BodyTemp))^2 )/nrow(train_data))
+RMSE_null_test <- sqrt(sum( (test_data$BodyTemp - mean(test_data$BodyTemp))^2 )/nrow(test_data))
+print(RMSE_null_train)
+print(RMSE_null_test)
+```
+
+
+
+# Fit/tune different models
+
+## Tree model
+
+### Tree model setup 
+
+Starting with a tree-based model
+
+```{r, start-tree}
+# define the model
+tree_model <-  decision_tree() %>% 
+  set_args( cost_complexity = tune(), tree_depth = tune(), min_n = tune()) %>% 
+  set_engine("rpart") %>% 
+  set_mode("regression")           
+```
+
+```{r}
+#set workflow
+tree_wf <- workflow() %>%
+  add_model(tree_model) %>%
+  add_recipe(fit_recipe)
+```
+
+### Tree model tuning
+
+Define tune grid and do tuning. This might take a while.
+
+```{r, tune-tree}
+#for parallel computing
+#makes things faster. If not wanted, can be commented out, together with last line of this block.
+ncores = 18 #adjust based on your computer
+cl <- makePSOCKcluster(ncores)
+registerDoParallel(cl)
+
+#tuning grid
+tree_grid <- dials::grid_regular(cost_complexity(),
+                          tree_depth(),
+                          min_n(),
+                          levels = 5)
+#tune the model
+tree_tune_res <- tree_wf %>% 
+  tune::tune_grid(
+    resamples = cv_data,
+    grid = tree_grid,
+    metrics = yardstick::metric_set(rmse) 
+  )
+# turn off parallel cluster
+stopCluster(cl)
+```
+
+
+### Tree model evaluation
+
+Now that tuning is done, look at the model results.
+Plot of model performance during tuning.
+
+```{r}
+#see a plot of performance for different tuning parameters
+tree_tune_res %>% autoplot()
+```
+
+Getting the model that was determined to be best (via cross-validation) by tuning.
+
+```{r}
+# get the tuned model that performs best 
+best_tree <- tree_tune_res %>%  select_best(metric = "rmse")
+# finalize workflow with best model
+best_tree_wf <- tree_wf %>% finalize_workflow(best_tree)
+# fitting best performing model
+best_tree_fit <- best_tree_wf %>% 
+                 fit(data = train_data)
+#predicting outcomes for final model
+tree_pred <- predict(best_tree_fit, train_data)
+```
+
+
+Plotting final tree.
+
+```{r}
+rpart.plot(extract_fit_parsnip(best_tree_fit)$fit)
+```
+
+
+
+Plotting observed/predicted and residuals.
+
+```{r}
+#predicted versus observed
+plot(tree_pred$.pred,train_data$BodyTemp)
+#residuals
+plot(tree_pred$.pred-train_data$BodyTemp)
+```
+
+
+Looking at model performance. I think it would be more intuitive to get the performance from the `best_tree_fit` object, but I can't figure out how to do that.
+
+```{r}
+tree_perfomance <- tree_tune_res %>% show_best(n = 1)
+print(tree_perfomance)
+```
+
+Comparing thei RMSE to the null model, we see that it is not much better. 
+
+Based on our model evaluation, I think we can safely say here that a tree-based model is no good.
+
+
+## LASSO linear model
+
+Repeating the steps above, now for LASSO.
+
+
+### LASSO setup
+
+Note that `lr` stands for linear regression. I could have called it `lasso_model` as well.
+
+```{r, start-lasso}
+#model
+lr_model <- linear_reg() %>%
+  set_mode("regression") %>%           
+  set_engine("glmnet") %>%
+  set_args(penalty = tune(), mixture = 1) #mixture = 1 means LASSO model
+
+#workflow
+lr_wf <- workflow() %>%
+  add_model(lr_model) %>% 
+  add_recipe(fit_recipe)
+```
+
+
+
+### LASSO tuning
+
+```{r, tune-lasso}
+#parallel computing
+ncores = 18 #adjust based on your computer
+cl <- makePSOCKcluster(ncores)
+registerDoParallel(cl)
+
+
+#tuning grid
+lr_reg_grid <- tibble(penalty = 10^seq(-4, -1, length.out = 30))
+
+#tune model
+lr_tune_res <- lr_wf %>% 
+  tune_grid(resamples = cv_data,
+            grid = lr_reg_grid,
+            control = control_grid(save_pred = TRUE),
+            metrics = metric_set(rmse)
+            )
+# turn off parallel cluster
+stopCluster(cl)
+```
+
+
+### LASSO evaluation
+
+```{r}
+#see a plot of performance for different tuning parameters
+lr_tune_res %>% autoplot()
+```
+
+
+
+
+```{r}
+# get the tuned model that performs best 
+best_lr <- lr_tune_res %>%  select_best(metric = "rmse")
+
+# finalize workflow with best model
+best_lr_wf <- lr_wf %>% finalize_workflow(best_lr)
+
+# fitting best performing model
+best_lr_fit <- best_lr_wf %>% 
+  fit(data = train_data)
+lr_pred <- predict(best_lr_fit, train_data)
+```
+
+Plotting LASSO variables as function of tuning parameter
+
+
+```{r}
+x <- best_lr_fit$fit$fit$fit
+plot(x, "lambda")
+```
+
+
+Plotting observed/predicted and residuals.
+
+```{r}
+#predicted versus observed
+plot(lr_pred$.pred,train_data$BodyTemp)
+#residuals
+plot(lr_pred$.pred-train_data$BodyTemp)
+```
+
+
+Looking at model performance. 
+
+```{r}
+# code borrowed from Zane :)
+lr_perfomance <- lr_tune_res %>% show_best(n = 1)
+print(lr_perfomance)
+```
+
+So seems that the LASSO model is not quite as bad as the tree, but I wouldn't call it a good model. The observed/predicted and residual plots don't look great, and the performance is not much better. Let's see if we have more luck with the random forest.
+
+
+
+## Random forest model
+
+Repeating the steps above, now for a random forest.
+
+
+### Random forest setup
+
+
+```{r, start-rf}
+rf_model <- rand_forest() %>%
+  set_args(mtry = tune(),     
+    trees = tune(),
+    min_n = tune()
+  ) %>%
+  # select the engine/package that underlies the model
+  set_engine("ranger", num.threads = cores) %>%
+  # choose either the continuous regression or binary classification mode
+  set_mode("regression")           
+```
+
+
+```{r}
+#workflow
+rf_wf <- workflow() %>%
+  add_model(rf_model) %>% 
+  add_recipe(fit_recipe)
+```
+
+
+### Random forest tuning
+
+```{r, tune-rf}
+#parallel computing
+ncores = 18 #adjust based on your computer
+cl <- makePSOCKcluster(ncores)
+registerDoParallel(cl)
+
+#tuning grid
+rf_grid  <- expand.grid(mtry = c(2, 3, 4, 5), min_n = c(30,40,50), trees = c(500,1000)  )
+
+# tune the model, optimizing RMSE
+rf_tune_res <- rf_wf %>%
+  tune_grid(
+            resamples = cv_data, #CV object
+            grid = rf_grid, # grid of values to try
+            metrics = metric_set(rmse) 
+  )
+# turn off parallel cluster
+stopCluster(cl)
+```
+
+
+### Random forest evaluation
+
+```{r}
+#see a plot of performance for different tuning parameters
+rf_tune_res %>% autoplot()
+```
+
+```{r}
+# get the tuned model that performs best 
+best_rf <- rf_tune_res %>%  select_best(metric = "rmse")
+
+# finalize workflow with best model
+best_rf_wf <- rf_wf %>% finalize_workflow(best_rf)
+
+# fitting best performing model
+best_rf_fit <- best_rf_wf %>% 
+  fit(data = train_data)
+rf_pred <- predict(best_rf_fit, train_data)
+```
+
+
+For random forest models, one can't easily look at the final model. One can however look at the most important predictors for the final model.
+
+```{r}
+#pull out the fit object
+x <- best_rf_fit$fit$fit$fit
+#plot variable importance
+ranger::importance(x) 
+```
+
+
+
+
+
+Plotting observed/predicted and residuals.
+
+```{r}
+#predicted versus observed
+plot(rf_pred$.pred,train_data$BodyTemp)
+#residuals
+plot(rf_pred$.pred-train_data$BodyTemp)
+```
+
+
+Looking at model performance. 
+
+```{r}
+# code borrowed from Zane :)
+rf_perfomance <- rf_tune_res %>% show_best(n = 1)
+print(rf_perfomance)
+```
+
+So seems that RF isn't much better.
+
+
+# Model Selection
+
+So none of these models are really any good. Overall, we should conclude that - at least with the models tried so far - the predictor variable information is not very useful at predicting the outcome. 
+
+But for the sake of this exercise, we'll pick one model and apply it to the test data. Since RF and LASSO perform about the same, I'll go with the simpler LASSO. So let's give that model a final check.
+
+
+# Final Model Evaluation
+
+```{r}
+# fit on the training set and evaluate on test set
+final_fit <- best_lr_wf  %>% last_fit(data_split)
+```
+
+Let's look at the performance of the final fit
+
+```{r}
+test_performance <- final_fit %>% collect_metrics()
+print(test_performance)
+```
+
+If we compare that to the performance on the training data, we see it's similar. That's good. If we compare it to the perfomance of the null model on the test data, we see it's not much better. That's bad. It shows again that none of these models are good.
+
+And just another look at the diagnostic plots for the test data.
+
+```{r}
+test_predictions <- final_fit %>% collect_predictions()
+```
+
+
+Plotting observed/predicted and residuals.
+
+```{r}
+#predicted versus observed
+plot(test_predictions,test_data$BodyTemp)
+#residuals
+plot(test_predictions-test_data$BodyTemp)
+```
+
+Still bad.
+
+
+# Overall conclusion
+
+I didn't know this was going to happen, but it turns out that at least among the models we tried, we didn't find any that worked well. If we tried some other models, maybe there is one that predicts well. Or if we do some more processing/feature engineering, we might get better performance.
+
+More likely is that the predictor data we have is just not very predictive of the outcome. That happens, sometimes your data is just not good enough to say much. Having checks, such as diagnostic plots and comparison to null models is important to see if your model is good. 
+
+Of course for any real model, you shouldn't stop there. Once a model seems to perform well, there are still things that can be wrong, so carefully "poking" it until you fully understand the model is important.
+
+It could be that with this data, being able to predict the categorical outcome of `
+
+
+
+
