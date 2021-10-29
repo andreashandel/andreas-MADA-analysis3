@@ -314,7 +314,9 @@ rf_model <- rand_forest() %>%
     min_n = tune()
   ) %>%
   # select the engine/package that underlies the model
-  set_engine("ranger", num.threads = cores) %>%
+  set_engine("ranger",
+             num.threads = 18,
+             importance = "permutation") %>%
   # choose either the continuous regression or binary classification mode
   set_mode("regression")           
 ```
