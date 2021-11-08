@@ -6,14 +6,14 @@ output: html_document
 ---
 
   
+Data is being cleaned with the separate `processingscript.R` file.
 
-This script loads the cleaned data, 
-does a bit more processing, and then performs some ML analyses.
+This script loads the cleaned data, does a bit more processing, and then performs some ML analyses.
 
 
 # Setup
 
-```{r}
+```{r, message = FALSE}
 #load needed packages. make sure they are installed.
 library(broom) #for cleaning up output from lm()
 library(here) #for data loading/saving
@@ -69,7 +69,7 @@ cv_data <- rsample::vfold_cv(train_data, v = 5, repeats = 5, strata = 'BodyTemp'
 
 # Preprocessing
 
-create a recipe for the model fitting. we don't need to remove any NA or do imputation or standardization or anything else.
+Create a recipe for the model fitting. We don't need to remove any NA or do imputation or standardization or anything else.
 Therefore our recipe is fairly short, we just code all categorical variables as dummy variables.
 
 ```{r}
@@ -81,7 +81,7 @@ fit_recipe <-
 
 # Null model
 
-For a continuous outcome, a null-model that doesn't use any predictor information is one that always just predicts the mean of the data. We'll compute the performance of such a "model" here. It's useful for comparison with the real models. We'll print both numbers here, and then compare with our model results below.
+For a **continuous outcome**, using RMSE as our performance metric, a null-model that doesn't use any predictor information is one that always just predicts the mean of the data. We'll compute the performance of such a "model" here. It's useful for comparison with the real models. We'll print both numbers here, and then compare with our model results below. Since our performance metric is RMSE, we compute that here with the "model prediction" always just being the mean of the outcomes.
 
 ```{r}
 RMSE_null_train <- sqrt(sum( (train_data$BodyTemp - mean(train_data$BodyTemp))^2 )/nrow(train_data))
@@ -93,6 +93,8 @@ print(RMSE_null_test)
 
 
 # Fit/tune different models
+
+Now let's fit a few models.
 
 ## Tree model
 
@@ -117,20 +119,19 @@ tree_wf <- workflow() %>%
 
 ### Tree model tuning
 
-Define tune grid and do tuning. This might take a while.
+Define tune grid and do tuning. This might take a while. Note that there are many ways you can do the tuning with `tidymodels`.
+
+Also note that I'm using parallel computing below. This makes things run faster, but can at times be iffy. If you get weird error messages, you might want to comment out each command that has to do with parallel running, namely the `makePSOCKcluster`, `registerDoParallel` and `stopCluster()` commands everywhere. This just means your code will run longer.
 
 ```{r, tune-tree}
 #for parallel computing
 #makes things faster. If not wanted, can be commented out, together with last line of this block.
-ncores = 18 #adjust based on your computer
+ncores = 18 #adjust based on your computer. 
 cl <- makePSOCKcluster(ncores)
 registerDoParallel(cl)
 
 #tuning grid
-tree_grid <- dials::grid_regular(cost_complexity(),
-                          tree_depth(),
-                          min_n(),
-                          levels = 10)
+tree_grid <- dials::grid_regular(cost_complexity(), tree_depth(), min_n(), levels = 5)
 #tune the model
 tree_tune_res <- tree_wf %>% 
   tune::tune_grid(
@@ -145,8 +146,7 @@ stopCluster(cl)
 
 ### Tree model evaluation
 
-Now that tuning is done, look at the model results.
-Plot of model performance during tuning.
+Now that tuning is done, look at the tuning process a bit. This plots model performance during tuning.
 
 ```{r}
 #see a plot of performance for different tuning parameters
@@ -175,6 +175,8 @@ rpart.plot(extract_fit_parsnip(best_tree_fit)$fit)
 ```
 
 
+This is a bad tree. I got a different tree with a bit more tuning (though an overall not much better model).
+
 
 Plotting observed/predicted and residuals.
 
@@ -187,6 +189,8 @@ plot(tree_pred$.pred-train_data$BodyTemp)
 abline(a=0,b=0, col = 'red') #straight line, along which the results should fall
 ```
 
+We can see that the model only predicts 2 different values. Not a great model.
+
 
 Looking at model performance. I think it would be more intuitive to get the performance from the `best_tree_fit` object, but I can't figure out how to do that.
 
@@ -195,7 +199,7 @@ tree_perfomance <- tree_tune_res %>% show_best(n = 1)
 print(tree_perfomance)
 ```
 
-Comparing thei RMSE to the null model, we see that it is not much better. 
+Comparing the RMSE to the null model, we see that it is not much better. 
 
 Based on our model evaluation, I think we can safely say here that a tree-based model is no good.
 
@@ -207,14 +211,13 @@ Repeating the steps above, now for LASSO.
 
 ### LASSO setup
 
-Note that `lr` stands for linear regression. I could have called it `lasso_model` as well.
 
 ```{r, start-lasso}
 #model
 lasso_model <- linear_reg() %>%
   set_mode("regression") %>%           
   set_engine("glmnet") %>%
-  set_args(penalty = tune(), mixture = 1) #mixture = 1 means LASSO model
+  set_args(penalty = tune(), mixture = 1) #mixture = 1 means we use the LASSO model
 
 #workflow
 lasso_wf <- workflow() %>%
@@ -279,6 +282,9 @@ x <- best_lasso_fit$fit$fit$fit
 plot(x, "lambda")
 ```
 
+As one sees, the larger the regularization penalty, the fewer predictor variables that remain in the model. (Once a coefficient is at 0, the corresponding variable is not in the model anymore).
+
+
 This shows the variables that are part of the best-fit LASSO model, i.e. those that have a non-zero coefficient.
 
 ```{r}
@@ -297,16 +303,18 @@ plot(lasso_pred$.pred-train_data$BodyTemp)
 abline(a=0,b=0, col = 'red') #straight line, along which the results should fall
 ```
 
+The diagnostic plots show that this model isn't much better either. We want the points to be along the red lines in each plot. They are not.
+
+
 
 Looking at model performance. 
 
 ```{r}
-# code borrowed from Zane :)
 lasso_perfomance <- lasso_tune_res %>% show_best(n = 1)
 print(lasso_perfomance)
 ```
 
-So seems that the LASSO model is not quite as bad as the tree, but I wouldn't call it a good model. The observed/predicted and residual plots don't look great, and the performance is not much better. Let's see if we have more luck with the random forest.
+A somewhat lower RMSE, so a bit better performance. So seems overall that the LASSO model is not quite as bad as the tree, but I wouldn't call it a good model. The observed/predicted and residual plots don't look great, and the performance is not much better. Let's see if we have more luck with the random forest.
 
 
 
@@ -370,6 +378,9 @@ stopCluster(cl)
 rf_tune_res %>% autoplot()
 ```
 
+Based on the tuning plot, it might be worth doing more tuning, e.g. with higher minimum node size. Not doing that here, I don't think the model performance will improve a lot. (Though for a real research problem, I would explore more).
+
+
 ```{r}
 # get the tuned model that performs best 
 best_rf <- rf_tune_res %>%  select_best(metric = "rmse")
@@ -394,6 +405,7 @@ vip::vip(x, num_features = 20)
 ```
 
 
+Subjective fever being the most important/predictive variable for body temperature makes sense. So some internal consistency, which is good. Note that a RF model does not kick out any variables, all stay in, but some are more important than others.
 
 
 
@@ -412,22 +424,24 @@ abline(a=0,b=0, col = 'red') #straight line, along which the results should fall
 Looking at model performance. 
 
 ```{r}
-# code borrowed from Zane :)
 rf_perfomance <- rf_tune_res %>% show_best(n = 1)
 print(rf_perfomance)
 ```
 
-So seems that RF isn't much better.
+Based on the diagnostic plots and the model performance, it seems that RF isn't much better.
 
 
-# Model Selection
 
-So none of these models are really any good. Overall, we should conclude that - at least with the models tried so far - the predictor variable information is not very useful at predicting the outcome. 
+# Picking a Model 
+
+So none of these models are actually any good. Overall, we should conclude that - at least with the models tried so far - the predictor variable information is not very useful at predicting the outcome. 
 
 But for the sake of this exercise, we'll pick one model and apply it to the test data. Since RF and LASSO perform about the same, I'll go with the simpler LASSO. So let's give that model a final check.
 
 
 # Final Model Evaluation
+
+We'll now apply the model a single time to the test data.
 
 ```{r}
 # for reasons that make no sense (likely a bug in tidymodels)
@@ -439,14 +453,17 @@ final_fit <- best_lasso_wf  %>% last_fit(data_split)
 stopCluster(cl)
 ```
 
-Let's look at the performance of the final fit
+Let's look at the performance of the final fit, evaluated on the test data.
 
 ```{r}
 test_performance <- final_fit %>% collect_metrics()
 print(test_performance)
 ```
 
-If we compare the RMSE to the performance on the training data, we see it's similar. That's good. If we compare it to the performance of the null model on the test data, we see it's not much better. That's bad. It shows again that none of these models are good.
+If we compare the RMSE for the test data to the RMSE on the training data, we see it's similar. That's good, it suggests we might have avoided overfitting. In this case, since none of the models fit well anyway, the risk of overfitting wasn't really present.
+
+If we compare the RMSE on the test data to the performance/RMSE of the null model on the test data, we see it's not much better. That's bad. It shows again that none of these models are good.
+
 
 And just another look at the diagnostic plots for the test data.
 
@@ -469,16 +486,15 @@ abline(a=0,b=0, col = 'red') #straight line, along which the results should fall
 Still bad.
 
 
+
 # Overall conclusion
 
-I didn't know this was going to happen, but it turns out that at least among the models we tried, we didn't find any that worked well. If we tried some other models, maybe there is one that predicts well. Or if we do some more processing/feature engineering, we might get better performance.
+I didn't know this was going to happen, but it turns out that at least among the models I tried, and the amount of tuning I did, I didn't find any that worked well. If we tried some other models, maybe there is one that predicts well. Or if we do some more processing/feature engineering, or better tuning, we might get better performance. 
 
-More likely is that the predictor data we have is just not very predictive of the outcome. That happens, sometimes your data is just not good enough to say much. Having checks, such as diagnostic plots and comparison to null models is important to see if your model is good. 
+More likely is that the data we have is just not very predictive of the outcome. That happens, sometimes your data is just not good enough to say much. Having checks, such as diagnostic plots and comparison to null models is important to see if your model is good. 
 
-Of course for any real model, you shouldn't stop there. Once a model seems to perform well, there are still things that can be wrong, so carefully "poking" it until you fully understand the model is important.
+Of course for any real model, you should dig even deeper. If no model performs well, try to figure out why. Once a model seems to perform well, there are still things that can be wrong, so carefully "poking" it until you fully understand the model is important.
 
-It could be that with this data, being able to predict the categorical outcome of `
-
-
+It could be that with this data, being able to predict the categorical outcome of `Nausea` might work. Or maybe not. I haven't tried.
 
 
